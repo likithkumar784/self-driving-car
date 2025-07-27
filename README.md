@@ -1,98 +1,166 @@
-# Project 3 - Behavioral Cloning
+# Vehicle Detection Project
 
-The goal of the project was to train a Deep Network to replicate the human steering behavior while driving, thus being able to drive autonomously on a simulator provided by [Udacity](https://www.udacity.com/). To this purpose, the network takes as input the frame of the frontal camera (say, a roof-mounted camera) and predicts the steering direction at each instant.
+<p align="center">
+ <a href="https://www.youtube.com/watch?v=Cd7p5pnP3e0"><img src="./img/overview.gif" alt="Overview" width="50%" height="50%"></a>
+ <br>Qualitative results. (click for full video)
+</p>
 
-#### Demo here:
+## [Rubric](https://review.udacity.com/#!/rubrics/513/view) Points
 
-<a href="http://www.youtube.com/watch?feature=player_embedded&v=gXkMELjZmCc" target="_blank"><img src="http://img.youtube.com/vi/gXkMELjZmCc/0.jpg" 
-alt="project3" width="240" height="180" border="10" /></a>
+### Abstract
 
-## Code overview
+The goal of the project was to develop a pipeline to reliably detect cars given a video from a roof-mounted camera: in this readme the reader will find a short summary of how I tackled the problem.
 
-The code is structured as follows:
-- [`config.py`](config.py): project configuration and hyperparameters
-- [`model.py`](model.py): model definition and training
-- [`drive.py`](drive.py): interaction with the simulator (actually drive the car)
-- [`load_data.py`](load_data.py): definition of data generator + handling data augmentation
-- [`visualize_data.py`](visualize_data.py): exploratory visualization of the dataset, used in this readme
-- [`visualize_activations.py`](visualize_activations.py): visualization of the trained network activations, used in the demo video above
-- [`pretrained/`](pretrained/): contains pretrained model architecture and weights
+**Long story short**:
+ - (baseline) HOG features + linear SVM to detect cars, temporal smoothing to discard false positive
+ - (submission) [SSD deep network](https://arxiv.org/pdf/1512.02325.pdf) for detection, thresholds on detection confidence and label to discard false positive 
+ 
+*That said, let's go into details!*
 
-## The dataset
-Data for this task can be gathered with the Udacity simulator itself. Indeed, when the simulator is set to *training mode*, the car is controlled by the human though the keyboard, and frames and steering directions are stored to disk. For those who want to avoid this process, Udacity made also available an "off-the-shelf" training set. For this project, I employed this latter.
+### Good old CV: Histogram of Oriented Gradients (HOG)
 
-Udacity training set is constituted by 8036 samples. For each sample, two main information are provided:
-- three frames from the frontal, left and right camera respectively
-- the corresponding steering direction
+#### 1. Feature Extraction.
 
-### Visualizing training data
+In the field of computer vision, a *features* is a compact representation that encodes information that is relevant for a given task. In our case, features must be informative enough to distinguish between *car* and *non-car* image patches as accurately as possible.
 
-Here's how a typical sample looks like. We have three frames from different cameras as well as the associated steering direction.
+Here is an example of how the `vehicle` and `non-vehicle` classes look like in this dataset:
 
-![training_data_before_preprocessing](img/data_samples_before_preprocessing.png)
+<p align="center">
+  <img src="./img/noncar_samples.png" alt="non_car_img">
+  <br>Randomly-samples non-car patches.
+</p>
 
-First things first, every frame is preprocessed by cropping the upper and lower part of the frame: in this way we discard information that is probably useless for the task of predicting the steering direction. Now our input frames look like these: 
+<p align="center">
+  <img src="./img/car_samples.png" alt="car_img">
+  <br>Randomly-samples car patches.
+</p>
 
-![training_data_after_preprocessing](img/data_samples_after_preprocessing.png)
+The most of the code that relates to feature extraction is contained in [`functions_feat_extraction.py`](functions_feat_extraction.py). Nonetheless, all parameters used in the phase of feature extraction are stored as dictionary in [`config.py`](config.py), in order to be able to access them from anywhere in the project.
 
-As we see, each frame is associated to a certain steering angle. Unfortunately, there's a huge skew in the ground truth data distribution: as we can see the steering angle distribution is strongly biased towards the zero.
+Actual feature extraction is performed by the function `image_to_features`, which takes as input an image and the dictionary of parameters, and returns the features computed for that image. In order to perform batch feature extraction on the whole dataset (for training), `extract_features_from_file_list` takes as input a list of images and return a list of feature vectors, one for each input image.
 
-![data_skewness](img/training_data_distribution.png)
+For the task of car detection I used *color histograms* and *spatial features* to encode the object visual appearence and HOG features to encode the object's *shape*. While color the first two features are easy to understand and implement, HOG features can be a little bit trickier to master.
 
-### Data Augmentation
+#### 2. Choosing HOG parameters.
 
-Due to the aforementioned data imbalance, it's easy to imagine that every learning algorithm we would train on the raw data would just learn to predict the steering value 0. Furthermore, we can see that the "test" track is completely different from the "training" one form a visually point of view. Thus, a network naively trained on the first track would *hardly* generalize to the second one. Various forms of data augmentation can help us to deal with these problems.
+HOG stands for *Histogram of Oriented Gradients* and refer to a powerful descriptor that has met with a wide success in the computer vision community, since its [introduction](http://vc.cs.nthu.edu.tw/home/paper/codfiles/hkchiu/201205170946/Histograms%20of%20Oriented%20Gradients%20for%20Human%20Detection.pdf) in 2005 with the main purpose of people detection. 
 
-##### Exploting left and right cameras
+<p align="center">
+  <img src="./img/hog_car_vs_noncar.jpg" alt="hog" height="128">
+  <br>Representation of HOG descriptors for a car patch (left) and a non-car patch (right).
+</p>
 
-For each steering angle we have available three frames, captured from the frontal, left and right camera respectively. Frames from the side cameras can thus be employed to augment the training set, by appropriately correcting the ground truth steering angle. This way of augmenting the data is also reported in the [NVIDIA paper](https://arxiv.org/pdf/1604.07316v1.pdf).
+The bad news is, HOG come along with a *lot* of parameters to tune in order to work properly. The main parameters are the size of the cell in which the gradients are accumulated, as well as the number of orientations used to discretize the histogram of gradients. Furthermore, one must specify the number of cells that compose a block, on which later a feature normalization will be performed. Finally, being the HOG computed on a single-channel image, arises the need of deciding which channel to use, eventually computing the feature on all channels then concatenating the result.
 
-##### Brightness changes
+In order to select the right parameters, both the classifier accuracy and computational efficiency are to consider. After various attemps, I came up to the following parameters that are stored in [`config.py`](config.py):
+```
+# parameters used in the phase of feature extraction
+feat_extraction_params = {'resize_h': 64,             # resize image height before feat extraction
+                          'resize_w': 64,             # resize image height before feat extraction
+                          'color_space': 'YCrCb',     # Can be RGB, HSV, LUV, HLS, YUV, YCrCb
+                          'orient': 9,                # HOG orientations
+                          'pix_per_cell': 8,          # HOG pixels per cell
+                          'cell_per_block': 2,        # HOG cells per block
+                          'hog_channel': "ALL",       # Can be 0, 1, 2, or "ALL"
+                          'spatial_size': (32, 32),   # Spatial binning dimensions
+                          'hist_bins': 16,            # Number of histogram bins
+                          'spatial_feat': True,       # Spatial features on or off
+                          'hist_feat': True,          # Histogram features on or off
+                          'hog_feat': True}           # HOG features on or off
+```
 
-Before being fed to the network, each frame is converted to HSV and the Value channel is multiplied element-wise by a random value in a certain range. The wider the range, the more different will be on average the augmented frames from the original ones.  
+#### 3. Training the classifier
 
-##### Normal noise on the steering value
+Once decided which features to used, we can train a classifier on these. In [`train.py`](train.py) I train a linear SVM for task of binary classification *car* vs *non-car*. First, training data are listed a feature vector is extracted for each image:
+```
+    cars = get_file_list_recursively(root_data_vehicle)
+    notcars = get_file_list_recursively(root_data_non_vehicle)
 
-Given a certain frame, we have its associated steering direction. However, being steering direction a continuous value, we could argue that the one in the ground truth is not *necessarily* the only working steering direction. Given the same input frame, a slightly different steering value would probably work anyway. For this reason, during the training a light normal distributed noise is added to the ground truth value. In this way we create a little more variety in the data without completely twisting the original value. 
+    car_features = extract_features_from_file_list(cars, feat_extraction_params)
+    notcar_features = extract_features_from_file_list(notcars, feat_extraction_params)
+``` 
+Then, the actual training set is composed as the set of all car and all non-car features (labels are given accordingly). Furthermore, feature vectors are standardize in order to have all the features in a similar range and ease training.
+```
+    feature_scaler = StandardScaler().fit(X)  # per-column scaler
+    scaled_X = feature_scaler.transform(X)
+```
+Now, training the LinearSVM classifier is as easy as:
+```
+    svc = LinearSVC()  # svc = SVC(kernel='rbf')
+    svc.fit(X_train, y_train)
+```
+In order to have an idea of the classifier performance, we can make a prediction on the test set with `svc.score(X_test, y_test)`. Training the SVM with the features explained above took around 10 minutes on my laptop. 
 
-##### Shifting the bias
+### Sliding Window Search
 
-Finally, we introduced a parameter called `bias` belonging to range [0, 1] in the `data generator` to be able to mitigate the bias towards zero of the ground truth. Every time an example is loaded from the training set, a *soft* random theshold `r =  np.random.rand()` is computed. Then the example `i` is discarded from the batch if `steering(i) + bias < r`. In this way, we can tweak the ground truth distribution of the data batches loaded. The effect of the bias parameter on the distribution of the ground truth in a batch of 1024 frames is shown below:
+#### 1. Describe how (and identify where in your code) you implemented a sliding window search.  How did you decide what scales to search and how much to overlap windows?
 
-<img src="img/bias_parameter.png" alt="augmentation_correct_bias" width="550" height="500" align="middle"/>
+In a first phase, I implemented a naive sliding window approach in order to get windows at different scales for the purpose of classification. This is shown in function `compute_windows_multiscale` in [`functions_detection.py`](functions_detection.py). This turned out to be very slow. I utlimately implemented a function to jointly search the region of interest and to classify each window as suggested by the course instructor. The performance boost is due to the fact that HOG features are computed only once for the whole region of interest, then subsampled at different scales in order to have the same effect of a multiscale search, but in a more computationally efficient way. This function is called `find_cars` and implemented in [`functions_feat_extraction.py`](functions_feat_extraction.py). Of course the *tradeoff* is evident: the more the search scales and the more the overlap between adjacent windows, the less performing is the search from a computational point of view.
 
-## Network architecture
+#### 2. Show some examples of test images to demonstrate how your pipeline is working.  What did you do to optimize the performance of your classifier?
 
-Network architecture is borrowed from the aforementioned [NVIDIA paper](https://arxiv.org/pdf/1604.07316v1.pdf) in which they tackle the same problem of steering angle prediction, just in a slightly more unconstrained environment :-)
+Whole classification pipelin using CV approach is implemented in [`main_hog.py`](main_hog.py). Each test image undergoes through the `process_pipeline` function, which is responsbile for all phases: feature extraction, classification and showing the results.
 
-The architecture is *relatively shallow* and is shown below:
+<p align="center">
+  <img src="./img/pipeline_hog.jpg" alt="hog" height="256">
+  <br>Result of HOG pipeline on one of the test images.
+</p>
 
-<img src="img/nvidia_architecture.PNG" alt="nvidia_net" width="500" height="500"/>
+In order to optimize the performance of the classifier, I started the training with different configuration of the parameters, and kept the best one. Performing detection at different scales also helped a lot, even if exceeding in this direction can lead to very long computational time for a single image. At the end of this pipeline, the whole processing, from image reading to writing the ouput blend, took about 0.5 second per frame.
 
-Input normalization is implemented through a `Lambda` layer, which constitutes the first layer of the model. In this way input is standardized such that lie in the range [-1, 1]: of course this works as long as the frame fed to the network is in range [0, 255].
+### Computer Vision on Steroids, a.k.a. Deep Learning
 
-The choice of ELU activation function (instead of more traditional ReLU) come from [this](https://github.com/commaai/research/blob/master/train_steering_model.py) model of CommaAI, which is born for the same task of steering regression. On the contrary, the NVIDIA paper does not explicitly state which activation function they use.
+#### 1. SSD (*Single Shot Multi-Box Detector*) network
 
-Convolutional layers are followed by 3 fully-connected layers: finally, a last single neuron tries to regress the correct steering value from the features it receives from the previous layers.
+In order to solve the aforementioned problems, I decided to use a deep network to perform the detection, thus replacing the HOG+SVM pipeline. For this task employed the recently proposed  [SSD deep network](https://arxiv.org/pdf/1512.02325.pdf) for detection. This paved the way for several huge advantages:
+ - the network performs detection and classification in a single pass, and natively goes in GPU (*is fast*)
+ - there is no more need to tune and validate hundreds of parameters related to the phase of feature extraction (*is robust*)
+ - being the "car" class in very common, various pretrained models are available in different frameworks (Keras, Tensorflow etc.) that are already able to nicely distinguish this class of objects (*no need to retrain*)
+ - the network outputs a confidence level along with the coordinates of the bounding box, so we can decide the tradeoff precision and recall just by tuning the confidence level we want (*less false positive*) 
+ 
+The whole pipeline has been adapted to the make use of SSD network in file [`main_ssd.py`](main_ssd.py).
 
-### Preventing overfitting
+### Video Implementation
 
-Despite the strong data augmentation mentioned above, there's still room for the major nightmare of the data scientis, a.k.a. overfitting. In order to prevent the network from falling in love with the training track, dropout layers are aggressively added after each convolutional layer (*drop prob=0.2*) and after each fully-connected layer (*drop prob=0.5*) but the last one.
+#### 1. Provide a link to your final video output.  Your pipeline should perform reasonably well on the entire project video (somewhat wobbly or unstable bounding boxes are ok as long as you are identifying the vehicles most of the time with minimal false positives.)
+Here's a [link to my video result](https://www.youtube.com/watch?v=Cd7p5pnP3e0)
 
-### Training Details
 
-Model was compiled using Adam optimizer with default parameters and mean squared error loss w.r.t. the ground truth steering angle. Training took a couple of hours on the GPU of my laptop (NVIDIA GeForce GTX 960M). During the training `bias` parameter was set to 0.8, frame brightness (V channel) was augmented in the range [0.2, 1.5] with respect to the original one. Normal distributed noise added to the steering angle had parameters *mean=0*, *std=0.2*. Frame flipping was random with probabililty *0.5*.
+#### 2. Describe how (and identify where in your code) you implemented some kind of filter for false positives and some method for combining overlapping bounding boxes.
 
-## Testing the model
+In a first phase while I was still using HOG+SVM, I implemented a heatmap to average detection results from successive frames. The heatmap was thresholded to a minimum value before labeling regions, so to remove the major part of false positive. This process in shown in the thumbnails on the left of the previous figure.
 
-After the training, the network can successfully drive on both tracks. Quite surprisingly, it drives better and smoother on the test track with respect to the training track (at least from a qualitative point of view). I refer the reader to the [demo video](https://www.youtube.com/watch?v=gXkMELjZmCc) above for a visual evaluation of the model. This also comprises a visualization of the network's activations at different layer depth.
+When I turned to deep learning, as mentioned before I could rely on a *confidence score* to decide the tradeoff between precision and recall. The following figure shows the effect of thresholding SSD detection at different level of confidence. 
 
-### Discussion and future works
-In my opinion, these were the two main challenges in this project:
+<table style="width:100%">
+  <tr>
+    <th>
+      <p align="center">
+           <img src="./img/confidence_001.png" alt="low_confidence" height="256">
+           <br>SSD Network result setting minimum confidence = 0.01
+      </p>
+    </th>
+    <th>
+      <p align="center">
+           <img src="./img/confidence_050.png" alt="high_confidence" height="256">
+           <br>SSD Network result setting minimum confidence = 0.50
+      </p>
+    </th>
+  </tr>
+</table>
 
-1. skew distribution of training data (strong bias towards 0)
-2. relatively few training data, in one track only (risk of overfitting)
+Actually, while using SSD network for detection for the project video I found that integrating detections over time was not only useless, but even detrimental for performance. Indeed, being detections very precide and false positive almost zero, there was no need anymore to carry on information from previous detections. 
 
-Both these challenges has been solved, or at least mitigated, using aggressive data augmentation and dropoout. The main drawback I notice is that now the network has some difficulties in going just straight: it tends to steer a little too much even when no steering at all is needed. Beside this aspect, the network is able to safely drive on both tracks, never leaving the drivable portion of the track surface. 
+---
 
-There's still a lot of room for future improvements. Among these, would be interesting to predict the car *throttle* along with the steering angle. In this way the car would be able to mantain its speed constant even on the second track which is plenty of hills. Furthermore, at the current state enhancing the graphic quality of the simulator leads to worse results, as the network is not able to handle graphic details such as *e.g.* shadows. Collecting data from the simulator set with better graphic quality along with the appropriate data augmentation would likely mitigate this problem.
+### Discussion
+
+#### 1. Briefly discuss any problems / issues you faced in your implementation of this project.  Where will your pipeline likely fail?  What could you do to make it more robust?
+
+In the first phase, the HOG+SVM approach turned out to be slightly frustrating, in that strongly relied on the parameter chosed to perform feature extraction, training and detection. Even if I found a set of parameters that more or less worked for the project video, I wasn't satisfied of the result, because parameters were so finely tuned on the project video that certainly were not robust to different situations. 
+
+For this reason, I turned to deep learning, and I leveraged on an existing detection network (pretrained on Pascal VOC classes) to tackle the problem. From that moment, the sun shone again on this assignment! :-)
+
+### Acknowledgments
+
+Implementation of [Single Shot MultiBox Detector](https://arxiv.org/pdf/1512.02325.pdf) was borrowed from [this repo](https://github.com/rykov8/ssd_keras) and then slightly modified for my purpose. Thank you [rykov8](https://github.com/rykov8) for porting this amazing network in Keras-Tensorflow!

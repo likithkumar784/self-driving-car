@@ -1,74 +1,83 @@
-import tensorflow as tf
-from os import makedirs
-from os.path import exists, join
-from traffic_light_dataset import TrafficLightDataset
-from traffic_light_classifier import TrafficLightClassifier
+import os
+import pickle
+import time
+
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import LinearSVC
+
+from config import root_data_non_vehicle, root_data_vehicle, feat_extraction_params
+from functions_detection import draw_boxes
+from functions_detection import search_windows
+from functions_detection import slide_window
+from functions_feat_extraction import extract_features_from_file_list
+from project_5_utils import get_file_list_recursively
 
 
 if __name__ == '__main__':
 
-    # Parameters
-    input_h, input_w = 128, 128    # Shape to which input is resized
+    # read paths of training images
+    cars = get_file_list_recursively(root_data_vehicle)
+    notcars = get_file_list_recursively(root_data_non_vehicle)
 
-    # Init traffic light dataset
-    dataset = TrafficLightDataset()
-    dataset_file = 'traffic_light_dataset_npy/traffic_light_dataset_mixed_resize_{}.npy'.format(input_h)
-    dataset.init_from_npy(dataset_file)
+    print('Extracting car features...')
+    car_features = extract_features_from_file_list(cars, feat_extraction_params)
 
-    # Define model
-    classifier = TrafficLightClassifier(input_shape=[input_h, input_w], learning_rate=1e-4, verbose=True)
+    print('Extracting non-car features...')
+    notcar_features = extract_features_from_file_list(notcars, feat_extraction_params)
 
-    # Checkpoint stuff
-    saver = tf.train.Saver()  # saver to save the model after each epoch
-    checkpoint_dir = './checkpoint_mixed_{}'.format(input_h)  # checkpoint directory
-    if not exists(checkpoint_dir):
-        makedirs(checkpoint_dir)
+    X = np.vstack((car_features, notcar_features)).astype(np.float64)
 
-    with tf.Session() as sess:
+    # standardize features with sklearn preprocessing
+    feature_scaler = StandardScaler().fit(X)  # per-column scaler
+    scaled_X = feature_scaler.transform(X)
 
-        # Initialize all variables
-        sess.run(tf.global_variables_initializer())
+    # Define the labels vector
+    y = np.hstack((np.ones(len(car_features)), np.zeros(len(notcar_features))))
 
-        # Training parameters
-        batch_size         = 32
-        batches_each_epoch = 1000
+    # Split up data into randomized training and test sets
+    rand_state = np.random.randint(0, 100)
+    X_train, X_test, y_train, y_test = train_test_split(scaled_X, y, test_size=0.2, random_state=rand_state)
 
-        epoch = 0
+    print('Feature vector length:', len(X_train[0]))
 
-        while True:
+    # Define the classifier
+    svc = LinearSVC()  # svc = SVC(kernel='rbf')
 
-            loss_cur_epoch = 0
+    # Train the classifier (check training time)
+    t = time.time()
+    svc.fit(X_train, y_train)
+    t2 = time.time()
+    print(round(t2 - t, 2), 'Seconds to train SVC...')
 
-            for _ in range(batches_each_epoch):
+    # Check the score of the SVC
+    print('Test Accuracy of SVC = ', round(svc.score(X_test, y_test), 4))
 
-                # Load a batch of training data
-                x_batch, y_batch = dataset.load_batch(batch_size, augmentation=True)
+    # dump all stuff necessary to perform testing in a successive phase
+    with open('data/svm_trained.pickle', 'wb') as f:
+        pickle.dump(svc, f)
+    with open('data/feature_scaler.pickle', 'wb') as f:
+        pickle.dump(feature_scaler, f)
+    with open('data/feat_extraction_params.pickle', 'wb') as f:
+        pickle.dump(feat_extraction_params, f)
 
-                # Actually run one training step here
-                _, loss_this_batch = sess.run(fetches=[classifier.train_step, classifier.loss],
-                                              feed_dict={classifier.x: x_batch,
-                                                         classifier.targets: y_batch,
-                                                         classifier.keep_prob: 0.5})
+    # test on images in "test_images" directory
+    test_img_dir = 'test_images'
+    for test_img in os.listdir(test_img_dir):
+        image = cv2.imread(os.path.join(test_img_dir, test_img))
 
-                loss_cur_epoch += loss_this_batch
+        h, w, c = image.shape
+        draw_image = np.copy(image)
 
-            loss_cur_epoch /= batches_each_epoch
-            print('Loss cur epoch: {:.04f}'.format(loss_cur_epoch))
+        windows = slide_window(image, x_start_stop=[None, None], y_start_stop=[h//2, None],
+                               xy_window=(64, 64), xy_overlap=(0.8, 0.8))
 
-            # Eventually evaluate on whole test set when training ends
-            average_test_accuracy = 0.0
-            num_test_batches = 500
-            for _ in range(num_test_batches):
-                x_batch, y_batch = dataset.load_batch(batch_size)
-                average_test_accuracy += sess.run(fetches=classifier.accuracy,
-                                                  feed_dict={classifier.x: x_batch,
-                                                             classifier.targets: y_batch,
-                                                             classifier.keep_prob: 1.0})
-            average_test_accuracy /= num_test_batches
-            print('Training accuracy: {:.03f}'.format(average_test_accuracy))
-            print('*' * 50)
+        hot_windows = search_windows(image, windows, svc, feature_scaler, feat_extraction_params)
 
-            # Save the variables to disk.
-            save_path = saver.save(sess, join(checkpoint_dir, 'TLC_epoch_{}.ckpt'.format(epoch)))
+        window_img = draw_boxes(draw_image, hot_windows, color=(0, 0, 255), thick=6)
 
-            epoch += 1
+        plt.imshow(cv2.cvtColor(window_img, cv2.COLOR_BGR2RGB))
+        plt.show()
